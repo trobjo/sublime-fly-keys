@@ -1,58 +1,77 @@
-import itertools
 import subprocess
-from typing import List, Tuple
+from typing import Iterator, List, Tuple
 
-import sublime_plugin
-from sublime import DRAW_NO_OUTLINE, Edit, Region, Selection, View
-from sublime_api import set_timeout_async as set_timeout_async  # pyright: ignore
+import sublime
+from sublime import Edit, Region, RegionFlags, Selection, View
+from sublime_api import set_clipboard  # pyright: ignore
+from sublime_api import set_timeout  # pyright: ignore
 from sublime_api import view_add_regions  # pyright: ignore
+from sublime_api import view_erase_regions  # pyright: ignore
+from sublime_api import view_insert  # pyright: ignore
+from sublime_api import view_selection_clear  # pyright: ignore
+from sublime_api import view_show_region  # pyright: ignore
 from sublime_api import view_cached_substr as ssubstr  # pyright: ignore
 from sublime_api import view_erase as erase  # pyright: ignore
+from sublime_api import view_full_line_from_point as full_line  # pyright: ignore
 from sublime_api import view_selection_add_point as add_pt  # pyright: ignore
-from sublime_api import view_selection_add_region as add_region  # pyright: ignore
-from sublime_api import view_selection_subtract_region as subtract  # pyright: ignore
+from sublime_plugin import TextCommand
 
-BUFFER = []
-TIMER = 0
+from .base import selections
 
 
-def setClipboard(buffer):
-    clip = "".join(buffer)
-    if clip.isspace():
-        return
-    subprocess.run(["wl-copy"], input=clip.encode())
+class SmartDuplicateLineCommand(TextCommand):
+    """Ensures the cursors are put correctly on the next lines"""
 
-
-
-def copyMaybe():
-    global TIMER
-    TIMER -= 1
-    if TIMER == 0:
-        setClipboard(BUFFER)
-
-
-class CopyBufferCommand(sublime_plugin.TextCommand):
     def run(self, edit: Edit):
-        vi = self.view.id()
-        text = ssubstr(vi, 0, self.view.size())
-        subprocess.run(["wl-copy"], input=text.encode())
+        vid = self.view.id()
+        sels = selections(vid)
+        regions = {}
+        for reg in sels:
+            if reg.a == reg.b:
+                line = full_line(vid, reg.b)
+                regions[line.a] = line
+            else:
+                regions[reg.a] = reg
+
+        linelist = [regions[key] for key in sorted(regions)]
+
+        to_add = [linelist[0].a]
+        for i in range(len(linelist) - 1):
+            thisline = linelist[i]
+            nextline = linelist[i + 1]
+            if thisline.b != nextline.a:
+                to_add.append(thisline.b)
+                to_add.append(nextline.a)
+        to_add.append(linelist[-1].b)
+
+        for i in range(len(to_add) - 1, 0, -2):
+            a = to_add[i]
+            b = to_add[i - 1]
+            view_insert(vid, edit.edit_token, min(a, b), ssubstr(vid, a, b))
+        view_show_region(vid, Region(linelist[0].a, linelist[-1].b), True, True, False)
 
 
-class SmartDuplicateLineCommand(sublime_plugin.TextCommand):
-    def run(self, edit: Edit):
-        sels= self.view.sel()
-        lines = {line.a: line.b for r in sels if (line := self.view.full_line(r.b))}
-        vid= self.view.id()
-        for pt in sorted(lines.keys(), reverse=True):
-            self.view.insert(edit, pt,ssubstr(vid, pt,lines[pt]))
+def highlight_regions(view_id, regions):
+    name = "highlight_regions"
+    color = "markup.inserted"
+
+    view_add_regions(
+        view_id, name, regions, color, "", RegionFlags.NONE, [], "", None, None
+    )
+    set_timeout(lambda: view_erase_regions(view_id, name), 250)
 
 
-class SmartCopyCommand(sublime_plugin.TextCommand):
-    def run(
-        self, edit, whole_line: bool = False, cut: bool = False, append: bool = False
-    ) -> None:
+contiguous_regions = lambda content: all(
+    content[i].b == content[i + 1].a for i in range(len(content) - 1)
+)
+
+
+class SmartCopyCommand(TextCommand):
+    timer = 0
+
+    def run(self, edit, whole_line: bool = False, cut: bool = False) -> None:
         v: View = self.view
-        vi = v.id()
+        vid = v.id()
         sel = v.sel()
 
         if whole_line:
@@ -62,22 +81,17 @@ class SmartCopyCommand(sublime_plugin.TextCommand):
 
         lines = set()
         content: List[Region] = []
+
+        all_empty = True
         for r in sel:
             if r.a != r.b:
+                all_empty = False
                 content.append(r)
-                continue
+            elif (line := full_line(vid, r.b)).a not in lines:
+                lines.add(line.a)
+                content.append(line)
 
-            line = v.full_line(r.b)
-            if line.a in lines:
-                continue
-
-            lines.add(line.a)
-            content.append(line)
-
-        if only_empty_selections := all(r.b == r.a for r in sel):
-            clip = "".join(v.substr(reg) for reg in content)
-        else:
-            clip = "\n".join(v.substr(reg) for reg in content)
+        clip = ("" if all_empty else "\n").join(ssubstr(vid, r.a, r.b) for r in content)
 
         if cut:
             for reg in reversed(content):
@@ -85,36 +99,30 @@ class SmartCopyCommand(sublime_plugin.TextCommand):
 
         v.show(v.sel()[-1].b, False)
 
-        global BUFFER
-        if not append:
-            BUFFER = []
-        BUFFER.append(clip)
+        if clip.isspace():
+            return
+        self.timer += 1
 
-        global TIMER
-        TIMER += 1
+        def copy_to_clipboard():
+            self.timer -= 1
+            if self.timer == 0:
+                set_clipboard(clip)
+                sublime.active_window().status_message(f"Copied {len(clip)} characters")
 
-        set_timeout_async(copyMaybe, 50)
+        set_timeout(copy_to_clipboard, 50)
 
         if cut:
             return
 
-        name = "copy_regions"
-        regs = [self.view.full_line(r.b) if r.empty() else r for r in sel]
-        color = "markup.inserted"
-        view_add_regions(vi, name, regs, color, "", DRAW_NO_OUTLINE, [], "", None, None)
-        set_timeout_async(lambda: self.view.erase_regions("copy_regions"), 250)
+        highlight_regions(vid, content)
 
-        contiguous_regions = all(
-            content[i].b == content[i + 1].a for i in range(len(content) - 1)
-        )
-
-        if only_empty_selections and contiguous_regions:
+        if all_empty and contiguous_regions(content):
             keep_pointer = int(v.sel()[-1].b)
-            sel.clear()
-            add_pt(vi, keep_pointer)
+            view_selection_clear(vid)
+            add_pt(vid, keep_pointer)
 
 
-class SmartPasteCutNewlinesAndWhitespaceCommand(sublime_plugin.TextCommand):
+class SmartPasteCutNewlinesAndWhitespaceCommand(TextCommand):
     def run(self, edit: Edit) -> None:
         v: View = self.view
 
@@ -130,13 +138,13 @@ class SmartPasteCutNewlinesAndWhitespaceCommand(sublime_plugin.TextCommand):
         for clip in reversed(clips[:-1]):
             clip_pos.append((len(clip) + 1 + clip_pos[-1][0], len(clip) + 1))
 
-        rev_sel: reversed[Region] = reversed(sels)
+        rev_sel: Iterator[Region] = reversed(sels)
         for reg in rev_sel:
             if not reg.empty():
                 v.erase(edit, reg)
             v.insert(edit, reg.a, wschar.join(clips))
 
-        rev_sel_new: reversed[Region] = reversed(sels)
+        rev_sel_new: Iterator[Region] = reversed(sels)
         for reg in rev_sel_new:
             sels.add_all(
                 Region(reg.begin() - pos[0], reg.begin() - pos[0] + pos[1] - 1)
@@ -146,7 +154,7 @@ class SmartPasteCutNewlinesAndWhitespaceCommand(sublime_plugin.TextCommand):
         v.show(v.sel()[-1].b, False)
 
 
-class SmartPasteCutWhitespaceCommand(sublime_plugin.TextCommand):
+class SmartPasteCutWhitespaceCommand(TextCommand):
     def run(self, edit: Edit):
         v: View = self.view
 
@@ -160,129 +168,74 @@ class SmartPasteCutWhitespaceCommand(sublime_plugin.TextCommand):
             v.insert(edit, r.begin(), stripped_clipboard)
 
 
-def find_indent(
-    v: View,
-    line: Region,
-    region: Region,
-    wschar: str,
-    before: bool = False,
-) -> int:
-    vi = v.id()
-    if line.a == line.b:
-        if before:
-            l_beg = line.b
-            while l_beg > 1:
-                l_beg, l_end = v.line(l_beg - 1)
-                if (prev_line := ssubstr(vi, l_beg, l_end)).startswith(wschar):
-                    return len(prev_line) - len(prev_line.lstrip())
-        else:
-            l_end = line.b
-            while l_end < v.size():
-                l_beg, l_end = v.line(l_end + 1)
-                if (next_line := ssubstr(vi, l_beg, l_end)) != "":
-                    return len(next_line) - len(next_line.lstrip())
-        return 0
-    else:
-        if (line_content := v.substr(line)).isspace():
-            return region.b - line.a
-
-        if not before and (next_line_content := v.substr(v.line(line.b + 1))) != "":
-            line_content = next_line_content
-
-        return len(line_content) - len(line_content.lstrip())
+def selections_match_clipboard(vi: int, s: Selection, clips: List[str]) -> bool:
+    if len(clips) == len(s):
+        return True
+    # ensures we can insert with multiple selections
+    return len(clips) == len(set(ssubstr(vi, r.a, r.b) for r in s))
 
 
-class SmartPasteCommand(sublime_plugin.TextCommand):
-    def selections_match_clipboard(self, s: Selection, clips: List[str]) -> bool:
-        if len(clips) == len(s):
-            return True
-        vi = self.view.id()
-        # all(not r.empty() for r in s) and
-        return len(clips) == len(set(ssubstr(vi, r.a, r.b) for r in s))
-
-    def run(
-        self,
-        edit: Edit,
-        before: bool = False,
-        replace=True,
-        indent_same=False,
-        primary=False,
-    ) -> None:
+class SmartPasteCommand(TextCommand):
+    def run(self, edit: Edit, strip_whitespace: bool = False) -> None:
         v: View = self.view
 
-        wschar = " " if v.settings().get("translate_tabs_to_spaces") else "\t"
-        s: Selection = v.sel()
-        args = ["wl-paste", "-n"]
-
-        if primary:
-            args.append("--primary")
-        result = subprocess.run(args, stdout=subprocess.PIPE, text=True)
-
-        clipboard = result.stdout
-
-        clips = clipboard.splitlines()
-        vi = v.id()
-
-        selections_match = self.selections_match_clipboard(s, clips)
-        if replace:
-            [erase(vi, edit.edit_token, r) for r in s if r.a != r.b]
-            # return
-        else:
-            if before:
-                [(subtract(vi, r.begin(), r.end()), add_pt(vi, r.begin())) for r in s]
-            else:
-                [(subtract(vi, r.begin(), r.end()), add_pt(vi, r.end())) for r in s]
-
-        if not clipboard.endswith("\n"):
-            clipboard_iterator = clips if selections_match else [clipboard]
-            for r, cliplet in zip(s, itertools.cycle(clipboard_iterator)):
-                insert_pos = r.begin() if before else r.end()
-                v.insert(edit, insert_pos, cliplet)
-                add_region(vi, insert_pos, insert_pos + len(cliplet), 0.0)
+        if v.is_read_only():
+            sublime.status_message("View is read-only")
             return
 
-        stripped_lines = [line.lstrip() for line in clips]
-        if selections_match:
-            for r, cliplet in zip(s, itertools.cycle(stripped_lines)):
-                line_reg = v.line(r.begin())
-                insert_pos = line_reg.a if before else v.full_line(r.begin()).b
-                indent = find_indent(v, line_reg, r, wschar, before)
-                insert_string = wschar * indent + cliplet + "\n"
-
-                s.subtract(r)
-                v.insert(edit, insert_pos, insert_string)
-                add_pt(vi, insert_pos + indent)
+        if v.settings().get("translate_tabs_to_spaces"):
+            wschar = " "
+            tabsize: int = v.settings().get("tab_size")
         else:
-            content_line = -1
-            padding = 0
-            line_lengths = []
-            for i, line in enumerate(clips):
-                line_lengths.append(len(line))
-                if line.isspace():
-                    padding += len(line)
-                elif not (len(line) == 0) and content_line == -1:
-                    content_line = i
-            if content_line == -1:
-                content_line = 0
+            wschar = "\t"
+            tabsize = 1
 
-            init_indent = len(clips[content_line]) - len(stripped_lines[content_line])
-            for r in s:
-                line_reg = v.line(r.begin())
-                insert_pos = line_reg.a if before else v.full_line(r.begin()).b
-                buf_indent = indent = find_indent(v, line_reg, r, wschar, before)
-                strings = []
-                for lline, sline in zip(line_lengths, stripped_lines):
-                    if not indent_same:
-                        indent = buf_indent + lline - len(sline) - init_indent
-                        # if wschar == "\t":
-                        # indent = int(indent / 4)
+        s: Selection = v.sel()
 
-                    strings.extend([wschar * indent, sline, "\n"])
+        if not (clipboard := sublime.get_clipboard()):
+            return
 
-                insert_string = "".join(strings)
+        clips = clipboard.splitlines()
+        length = len(clips)
 
+        indent_lengths = [int((len(l) - len(l.lstrip()))) for l in clips if l] or [0]
+        base_indent = min(indent_lengths)
+        lines = [c[base_indent:] for c in clips]
+
+        delim = " " if strip_whitespace else "\n"
+
+        def getclip(_: int, i: int) -> str:
+            return clips[i % length]
+
+        def indented_line(target_indent: int, i: int) -> str:
+            return wschar * target_indent + lines[i % length]
+
+        def whole_clipboard(target_indent, _: int) -> str:
+            return delim.join(indented_line(target_indent, i) for i in range(length))
+
+        selections_match = selections_match_clipboard(v.id(), s, clips)
+
+        if clipboard.endswith("\n") and not strip_whitespace:
+            indentfunc = indented_line if selections_match else whole_clipboard
+            for i, r in enumerate(s):
+                line = v.line(r.b)
+                insert_pos = line.a
+                indent_level = v.indentation_level(r.b)
+                insert_string = indentfunc(indent_level * tabsize, i)
                 s.subtract(r)
+
+                v.insert(edit, insert_pos, delim)
                 v.insert(edit, insert_pos, insert_string)
-                add_pt(vi, insert_pos + buf_indent + content_line + padding)
+
+                caret_line_pos = r.b - line.a
+                insert_line_len = v.line(insert_pos).b - insert_pos
+                s.add(min(caret_line_pos, insert_line_len) + insert_pos)
+        else:
+            indentfunc = getclip if selections_match else whole_clipboard
+            for i, r in enumerate(s):
+                if r.a != r.b:
+                    erase(v.id(), edit.edit_token, r)
+                insert_string = indentfunc(0, i)
+                v.insert(edit, r.begin(), insert_string)
 
         v.show(v.sel()[-1].b, False)

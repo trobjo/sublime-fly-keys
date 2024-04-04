@@ -1,0 +1,5 @@
+[
+    {"command": "swap_line_down"},
+    {"command": "caret_context"},
+    {"command": "scroll_lines", "args": {"amount": -1.0 }},
+]

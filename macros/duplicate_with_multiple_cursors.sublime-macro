@@ -1,7 +1,0 @@
-[
-    {"command": "create_region_from_selections"},
-    {"command": "duplicate_line"},
-    {"command": "split_selection_into_lines"},
-    {"command": "move_to", "args": {"to": "hardbol", "extend": false} },
-    {"command": "move_to", "args": {"to": "bol", "extend": false} },
-]

@@ -1,23 +1,18 @@
 import re
 import time
 
-import sublime_plugin
-from sublime import FindFlags, Region
+from sublime import Edit
 from sublime_api import view_selection_add_point as add_point  # pyright: ignore
 from sublime_api import view_selection_add_region as add_region  # pyright: ignore
 from sublime_api import view_show_point as show_point  # pyright: ignore
 from sublime_plugin import TextCommand
 
-from .base import buffer_slice
-
-then = time.time()
-
-normwd=r"[-\w]+"
-normrgx = re.compile(normwd)
-wholergx = re.compile(r"\S+")
+from .base import buffer_slice, selections
 
 
 class NavigateWordCommand(TextCommand):
+    whitespace = re.compile(r"\S+")
+
     def run(
         self, _, forward: bool = True, whole_words: bool = False, extend: bool = False
     ):
@@ -26,15 +21,21 @@ class NavigateWordCommand(TextCommand):
         if len(s) < 1:
             return
 
+        if whole_words:
+            rgx = self.whitespace
+        else:
+            word_separators = re.escape(v.settings().get("word_separators"))
+            rgx = re.compile(f"[^{word_separators}\\s]+")
+
         vid = v.id()
         pts = []
-        rgx = wholergx if whole_words else normrgx
 
-        bufind = buffer_slice(v, forward)
-        bufind.send(None)
-        for a, b in s if forward else reversed(s):
+
+        b_iter = buffer_slice(v, forward, chunksize=1000)
+        b_iter.send(None)
+        for a, b in s:
             mend = b
-            while match := bufind.send((mend, rgx)):
+            while (match := b_iter.send((mend, rgx)))[0] is not None:
                 mstart, mend = match
                 if mstart == b and (mend == a or (extend and forward is (a > mend))):
                     continue
@@ -52,163 +53,106 @@ class NavigateWordCommand(TextCommand):
 
         s.clear()
         for start, end in pts:
-            add_region(vid, start, end, 0.0)
-        show_point(vid, s[-1 if forward else 0].b, False, False, False)
+            add_region(vid, start, end, -1)
+
+        show_point(vid, s[-1 if forward else 0].b, True, True, False)
 
 
 class NavigateParagraphCommand(TextCommand):
-    forward = re.compile(r"(\n[\t ]*){2,}")
-    backward = re.compile(r"\S(?=[\t ]*\n\n)")
+    forward = re.compile(r"(\n[\t ]*){2,}", re.MULTILINE)
+    backward = re.compile(r"\S(?=[\t ]*\n\n)", re.MULTILINE)
 
-    def add_regs(self, regs, forward: bool, extend: bool = False):
+    backpat = re.compile(r"\S\s*\n")
+
+    f_extend = re.compile(r"\S\n(?=\n[\t ]*)")
+    b_extend = re.compile(r".(?=\n\n)", re.MULTILINE)
+
+    shrink_f = re.compile(r"\n\n(?=[\t ]*\S)")
+    shrink_b = re.compile(r"\n(?=\n\S)", re.MULTILINE)
+
+    sels = set()
+    then = time.time()
+
+    prev_forward = True
+
+    def run(self, _: Edit, forward: bool, extend: bool, force_paragraph: bool = False):
         v = self.view
-        s = v.sel()
         vid = v.id()
-
-        s.clear()
-        if extend:
-            for a, b, *_ in regs:
-                add_region(vid, a, b, 0.0)
-        else:
-            for a, b, *_ in regs:
-                add_point(vid, b)
-
-        show_point(vid, s[-1 if forward else 0].b, False, False, False)
-
-
-sels = set()
-
-
-class LineOrParagraphCommand(NavigateParagraphCommand):
-    backpat = re.compile(r"\S\s*(\n|\Z)")
-
-    def run(self, _, forward: bool = True):
-        v = self.view
-        s = v.sel()
-        global sels
-        global then
-        now = time.time()
-
-        bufind = buffer_slice(v, forward, True)
-        bufind.send(None)
+        s = selections(vid)
         current_sels = {r.b for r in s}
-        check_lines = (
-            any(r.a != r.b for r in s) or now - then >= 1 or bool(sels - current_sels)
+        now = time.time()
+        check_line_ends = (
+            not force_paragraph
+            and all(v.line(r.a).b == v.line(r.b).b for r in s)
+            and (
+                (now - self.then >= 1 or self.prev_forward != forward)
+                or bool(self.sels - current_sels)
+            )
         )
+        self.prev_forward = forward
+        self.then = now
 
-        if check_lines:
+        b_f = buffer_slice(v, True, True)
+        b_f.send(None)
+
+        b_b = buffer_slice(v, False, True)
+        b_b.send(None)
+
+        if check_line_ends:
             if forward:
                 regs = [(r.begin(), v.line(r.b).b, r.b) for r in s]
             else:
                 regs = []
-                for r in reversed(s):
+                for r in s:
                     line = v.line(r.b)
-                    end = bufind.send((line.b, self.backpat))[0] - 1
+                    end = b_b.send((line.b, self.backpat))[0] - 1
                     start = end if end < line.a else max(r.end(), end)
                     regs.append((start, end, r.b))
-            check_lines = any(b != c for _, b, c in regs)
+            check_line_ends = any(b != c for _, b, c in regs)
 
-        if not check_lines:
-            pattern = self.forward if forward else self.backward
-            sel = s if forward else reversed(s)
-            regs = [bufind.send((b - 1, pattern)) for a, b in sel]
-            then = now
+        if check_line_ends:
+            regs = [(a, b) for (a, b, _) in regs]
+            pass
 
-        sels = {b for (a, b, *_) in regs}
-        self.add_regs(regs, forward, check_lines)
+        elif forward and extend:
+            regs = [
+                b_f.send((r.b, self.shrink_f if r.a > r.b else self.f_extend))
+                for r in s
+            ]
+        elif forward and not extend:
+            regs = [b_f.send((r.b, self.forward)) for r in s]
+        elif not forward and extend:
+            regs = [
+                b_b.send(
+                    (r.b, self.shrink_b if v.line(r.a).b < r.end() else self.b_extend)
+                )
+                for r in s
+            ]
+        else:  # not forward and not extend
+            regs = [b_b.send((r.b, self.backward)) for r in s]
 
+        regs = [(m, n) for (m, n) in regs if n is not None]
+        if not regs:
+            return
 
-class ExpandParagraphCommand(NavigateParagraphCommand):
-    forline = re.compile(r"\S\n(?=\n[\t ]*)")
-    shrink_forline = re.compile(r"\n\n(?=[\t ]*\S)")
-    backline = re.compile(r".[\t ]*(?=(([\t ]*\n){2,}))")
-    shrink_backline = re.compile(r"\n(?=\n\S)")
+        v.sel().clear()
 
-    def run(self, _, forward: bool = True):
-        v = self.view
-        s = v.sel()
-
-        all_empty = all(r.a == r.b for r in s)
-        buffinder_b = buffer_slice(v, forward, True)
-        buffinder_b.send(None)
-        pattern = self.forline if forward else self.backline
-        bregs = []
-        if forward:
-            shrinkpattern = self.shrink_forline
-            growpattern = self.forline
-        else:
-            shrinkpattern = self.shrink_backline
-            growpattern = self.backline
-
-        offset = -1 if forward else 1
-        for a, b in s if forward else reversed(s):
-            if a != b:
-                pattern = shrinkpattern if (a > b) is forward else growpattern
-                pt = buffinder_b.send((b, pattern))[1]
-                if forward and pt > a or not forward and pt < a:
-                    pt = buffinder_b.send((b, growpattern))[1]
-            else:
-                pt = buffinder_b.send((b + offset, growpattern))[1]
-
-            bregs.append(pt)
-
-        if all_empty:
-            buffinder_a = buffer_slice(v, not forward, True)
-            buffinder_a.send(None)
-            offset = 1 if forward else -1
-
-            _pattern = self.backline if forward else self.forline
-
-            a_regs = [
-                buffinder_a.send((b + offset, _pattern))
-                for a, b in (s if forward else reversed(s))
+        if extend and forward and not check_line_ends:
+            regs = [
+                (r.end() if r.a > r.b else v.line(r.begin()).a, m[1])
+                for (r, m) in zip(s, regs)
+            ]
+        elif extend and not forward and not check_line_ends:
+            regs = [
+                (r.begin() if v.line(r.a).b < r.end() else r.end(), m[1])
+                for (r, m) in zip(s, regs)
             ]
 
-            aregs = [b for a, b in a_regs]
+        if extend:
+            for cursor in regs:
+                add_region(vid, *cursor, 0.0)
         else:
-            aregs = [
-                (b if ((x >= a > b) if forward else (x <= a < b)) else a)
-                for (a, b), x in zip(s, bregs)
-            ]
+            for cursor in regs:
+                add_point(v.view_id, cursor[1])
 
-        regs = list(zip(aregs, bregs))
-
-        self.add_regs(regs, forward, True)
-
-
-class SmartFindWordCommand(sublime_plugin.TextCommand):
-    def run(self, _) -> None:
-        v = self.view
-        for reg in self.view.sel():
-            caret = reg.b
-
-            candidatef_priority = 0
-            candidateb_priority = 0
-
-            candidatef = self.view.find(pattern=r"\w", start_pt=caret, flags=FindFlags.NONE).b
-            candidateb = self.view.find(pattern=r"\w", start_pt=caret, flags=FindFlags.REVERSE).a
-
-            # -1 means no match, we skip this region
-            if candidatef == -1 and candidateb == -1:
-                continue
-
-            current_line_end = v.full_line(caret).b
-
-            if candidatef != -1 and current_line_end == v.full_line(candidatef).b:
-                candidatef_priority+=1
-
-            if candidateb != -1 and current_line_end == v.full_line(candidateb).b:
-                candidateb_priority+=1
-
-
-            if candidateb_priority == candidatef_priority:
-                # with equal priority, we pick the nearest match
-                candidate = candidateb if (caret - candidateb) < (candidatef - caret) else candidatef
-            else:
-                candidate = candidateb if candidateb_priority > candidatef_priority else candidatef
-
-
-            self.view.sel().subtract(reg)
-            add_point(self.view.id(), candidate)
-
-        self.view.run_command("find_under_expand")
+        v.show(regs[-1][1], show_surrounds=True, keep_to_left=True)

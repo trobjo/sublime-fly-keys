@@ -1,0 +1,6 @@
+[
+    { "command": "move_to", "args": {"to": "eol", "extend": false} },
+    {"command": "navigate_paragraph", "args": {"forward": false, "extend": true, "force_paragraph": true}},
+    {"command":"move"                        ,"args":{"by":"characters","forward":false}},
+    {"command": "navigate_paragraph", "args": {"forward": true, "extend": true, "force_paragraph": true}},
+]

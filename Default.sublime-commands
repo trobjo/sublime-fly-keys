@@ -1,7 +1,67 @@
 [
     {
-        "caption": "Enable Save After Number Change",
-        "command": "enable_save_after_number_change"
+        "caption": "UNIX: command (stdin)",
+        "command": "run_unix"
+    },
+    {
+        "caption": "Clear UNIX Cache",
+        "command": "unix_clear_cmd_cache"
+    },
+    {
+        "caption": "UNIX: recent commands",
+        "command": "recent_unix_commands"
+    },
+    {
+        "args": {
+            "proc": "tr -d '[:space:]'"
+        },
+        "caption": "UNIX: Trim whitespace (tr -d '[:space:]')",
+        "command": "run_unix"
+    },
+    {
+        "args": {
+            "proc": "autoflake --remove-all-unused-imports - | isort - | black --quiet -",
+            "whole_buffer": true
+        },
+        "caption": "UNIX: Run Python Formatters",
+        "command": "run_unix",
+    },
+    {
+        "args": {
+            "error_regex": "line (\\d+), column (\\d+)",
+            "proc": "jq --sort-keys --indent 4 .",
+            "whole_buffer": true
+        },
+        "caption": "UNIX: Run jq --sort-keys",
+        "command": "run_unix"
+    },
+    {
+        "args": {
+            "index": 0
+        },
+        "caption": "UNIX: Repeat last command",
+        "command": "recent_unix_commands"
+    },
+    {
+        "args": {
+            "shell": true
+        },
+        "caption": "UNIX: command (stdin) (in shell)",
+        "command": "run_unix"
+    },
+    {
+        "args": {
+            "whole_buffer": true
+        },
+        "caption": "UNIX: command (stdin) (whole buffer)",
+        "command": "run_unix"
+    },
+    {
+        "args": {
+            "arginput": true
+        },
+        "caption": "UNIX: command (arginput)",
+        "command": "run_unix"
     },
     {
         "caption": "Copy Whole File",
@@ -12,27 +72,10 @@
         "command": "align_cursors"
     },
     {
-        "caption": "Disable Save After Number Change",
-        "command": "disable_save_after_number_change"
-    },
-    {
-        "caption": "Split Selection By Delitimer",
-        "command": "select_only_delimiter_in_selection"
-    },
-    {
-        "caption": "Sublime Fly Key Bindings",
-        "command": "open_file",
-        "args":
-        {
+        "args": {
             "file": "${packages}/sublime-fly-keys/Default.sublime-keymap"
-        }
-    },
-    {
-        "args":
-        {
-            "include": true
         },
-        "caption": "Select Only Delimiter In Selection",
-        "command": "select_only_delimiter_in_selection"
+        "caption": "Sublime Fly Key Bindings",
+        "command": "open_file"
     }
 ]

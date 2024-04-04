@@ -1,141 +1,114 @@
 import re
+
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import sublime_plugin
-from sublime import Edit, Region, View, active_window
+from sublime import Edit, Region, View
 from sublime_api import view_cached_substr as substr  # pyright: ignore
+from sublime_api import view_size  # pyright: ignore
+from sublime_api import view_line_from_point as line_from_point  # pyright: ignore
 from sublime_api import view_selection_add_point as add_point  # pyright: ignore
+from sublime_api import view_selection_add_point as add_pt  # pyright: ignore
 from sublime_api import view_selection_add_region as add_region  # pyright: ignore
-from sublime_api import view_selection_size as selection_length  # pyright: ignore
 from sublime_api import view_selection_get as ith_selection  # pyright: ignore
-from sublime_api import (
-    view_selection_subtract_region as subtract_region,  # pyright: ignore
+from sublime_api import view_selection_size as selection_length  # pyright: ignore
+from sublime_api import (  # pyright: ignore
+    view_selection_subtract_region as subtract_region,
 )
 from sublime_api import view_show_point as show_point  # pyright: ignore
-from sublime_plugin import TextCommand, TextInputHandler
+from sublime_plugin import TextCommand
 
-from .base import buffer_slice
+from .base import buffer_slice, selections
 
-# expand to next
-matchers: str = """([{)]}"'"""
-PositionAndType = Tuple[int, int]
+class ClearSelectionCommand(sublime_plugin.TextCommand):
+    def run(self, _, forward: bool = True) -> None:
+        v = self.view
+        vid = v.view_id
+        regs = selections(v.view_id)
+        v.sel().clear()
+        for pt in [p.end() for p in regs] if forward else [p.begin() for p in regs]:
+            add_pt(vid, pt)
 
 
-pattern_cache = {}
 
-
-
-
-class AlignCursors(sublime_plugin.TextCommand):
-
+class AlignCursors(TextCommand):
     def run(self, edit: Edit):
-        max_point = 0
-        for cursor in self.view.sel():
-            _, point = self.view.rowcol(cursor.b)
-            if max_point < point:
-                max_point = point
+        v = self.view
+        max_point = max(v.rowcol(r.b)[1] for r in v.sel()) or 0
 
-        for cursor in reversed(self.view.sel()):
-            _, point = self.view.rowcol(cursor.b)
+        for cursor in reversed(v.sel()):
+            _, point = v.rowcol(cursor.b)
             if point < max_point:
-                self.view.insert(edit, cursor.b, ' ' * (max_point - point))
+                v.insert(edit, cursor.b, " " * (max_point - point))
+
+
+view_directions = {}
+
 
 class SmarterSelectLines(TextCommand):
-    def run(self, edit, forward: bool):
+    def run(self, edit, forward: bool, force_expand=False, follow_column=False):
         v = self.view
-        s = v.sel()
-
-        if len(s) == 0:
-            return
-
-        if [
-            (s.subtract(x), s.add(x.b if forward else x.a))
-            for x in filter(lambda r: r.a != r.b, s)
-        ]:
-            return
-
         vid = v.id()
+        s = selections(vid)
+        reg_lines = {}
+        nextlines = {}
 
-        hardeol = True
-        softbol = True
+        for r in s:
+            l = line_from_point(vid, r.b)
+            nextlines[l.a - 1 if forward else l.b + 1] = l
+            reg_lines[r.a, r.b] = l
 
+        if len(nextlines) == 0:
+            return
+
+        global view_directions
+        if len(nextlines) == 1 or force_expand:
+            view_directions[vid] = forward
+
+        elif view_directions.get(vid, not forward) is not forward:
+            l = v.line(s[0 if forward else -1])
+            for r in s:
+                if l.a <= r.begin() <= l.b and l.a <= r.end() <= l.b:
+                    subtract_region(vid, r.a, r.b)
+            v.show(v.sel()[0 if forward else -1])
+
+            return
+
+        hardeol = any(r.begin() != v.line(r.begin()).a for r in s) and all(
+            r.end() == v.line(r.end()).b for r in s
+        )
         columns = []
+        size = view_size(vid)
+        for (a, b), line in reg_lines.items():
+            offset_end = b - line.a
+            offset_start = a - line.a
+            while line.b <= size and line.a >= 0:
+                line = nextlines.get(line.b) or nextlines.setdefault(
+                    line.b,
+                    line_from_point(vid, line.b + 1 if forward else line.a - 1),
+                )
+                if hardeol:
+                    columns.append((line.b - abs(a - b), line.b))
+                    break
 
-        selections = list(s)
-        for r in selections:
-            row, column = v.rowcol(r.b)
-            columns.append(column)
+                if not follow_column:
+                    start = min(line.a + offset_start, line.b)
+                    end = min(line.b, line.a + offset_end)
+                    columns.append((start, end))
+                    break
 
-            line = v.line(r.b)
-            if len(line) == 0:
-                continue  # can't decide if there is only a newline
+                if follow_column and len(line) >= max(offset_start, offset_end):
+                    columns.append((line.a + offset_start, line.a + offset_end))
+                    break
 
-            if line.b == r.b:
-                softbol = False
-            else:
-                hardeol = False
+        for r in columns:
+            add_region(vid, r[0], r[1], -1)
 
-            if softbol is True:
-                line_str = substr(vid, line.a, r.b + 1)
-                # cursor border check:
-                before_cursor = line_str[0:-1]
-                after_cursor = line_str[-1]
-
-                if (
-                    len(before_cursor) > 0 and not before_cursor.isspace()
-                ) or after_cursor.isspace():
-                    softbol = False
-
-        mode = "normal" if softbol == hardeol else "softbol" if softbol else "hardeol"
-
-        current_lines: set[int] = {v.line(r.b).a for r in selections}
-        if forward:
-            next_lines = [v.line(v.line(pt).b + 1) for _, pt in selections]
-        else:
-            next_lines = [v.line(v.line(pt).a - 1) for pt in current_lines if pt > 1]
-        folds = v.folded_regions()
-        for i, next_line in enumerate(next_lines):
-            if next_line.a in current_lines:
-                continue
-
-            if f := next((f for f in folds if next_line.intersects(f)), None):
-                [s.add(reg.a) for reg in v.lines(f)]
-
-            elif next_line.empty():
-                s.add(next_line.a)
-
-            elif mode == "hardeol":
-                s.add(next_line.b)
-
-            elif mode == "softbol":
-                mysubstr: str = substr(vid, next_line.a, next_line.b)
-                idx = len(mysubstr) - len(mysubstr.lstrip())
-                s.add(next_line.a + idx)
-            else:
-                col = columns[i]
-                s.add(min((next_line.a + col), next_line.b))
-
-        cursor = s[-1 if forward else 0]
-        for fold in folds:
-            if fold.intersects(cursor):
-                return
-        v.show(cursor.b)
+        v.show(v.sel()[-1 if forward else 0])
 
 
-def findall(p, s):
-    """Yields all the positions of
-    the pattern p in the string s."""
-    i = s.find(p)
-    length = len(p)
-    while i != -1:
-        yield i
-        i = s.find(p, i + length)
-
-
-
-
-class SubtractSelectionCommand(sublime_plugin.TextCommand):
+class SubtractSelectionCommand(TextCommand):
     def run(self, _, last=False) -> None:
         selections = self.view.sel()
         if len(selections) > 1:
@@ -144,7 +117,7 @@ class SubtractSelectionCommand(sublime_plugin.TextCommand):
             self.view.show(selections[sel].b, True)
 
 
-class RecordSelectionsCommand(sublime_plugin.TextCommand):
+class RecordSelectionsCommand(TextCommand):
     recorded_selections = {}
 
     def run(self, edit, retrieve: bool = False):
@@ -157,7 +130,9 @@ class RecordSelectionsCommand(sublime_plugin.TextCommand):
             self.recorded_selections[vi] = [(r.a, r.b) for r in sels]
 
 
-class FindNextLolCommand(sublime_plugin.TextCommand):
+class FindNextWholeCommand(TextCommand):
+    """Ensures word boundaries are respected when looking for the next word"""
+
     def run(self, edit, forward: bool = True):
         v: View = self.view
         v.run_command("clear_selection", args={"forward": True})
@@ -168,25 +143,30 @@ class FindNextLolCommand(sublime_plugin.TextCommand):
             v.run_command("find_prev")
 
 
-class SmarterFindUnderExpand(sublime_plugin.TextCommand):
+class SmarterFindUnderExpand(TextCommand):
     def run(
         self, _, forward: bool = True, skip: bool = False, find_all: bool = False
     ) -> None:
         v = self.view
         vid = self.view.id()
         s = self.view.sel()
+        word_separators = re.escape(v.settings().get("word_separators"))
+        word_start = f"(^|\\b(?<=[{word_separators}\\s]))"
+        word_end = f"((?=[{word_separators}\\s])|\\b|$)"
+
+        b_iter_f = buffer_slice(v, forward)
+        b_iter_f.send(None)
 
         first = max(s[0].begin() - 1, 0)
         last = min(s[-1].end() + 1, v.size())
 
         buf = f"\a{substr(vid, first, last)}\a"
-        middle = set()
+
         words: Dict[str, List[Region]] = defaultdict(list)
         compiled_regexes = {}
         for reg in s if forward else reversed(s):
             if reg.a == reg.b:
                 continue
-
             surroundings = buf[reg.begin() - first : reg.end() + 2 - first]
             if not forward:
                 surroundings = surroundings[::-1]
@@ -195,22 +175,21 @@ class SmarterFindUnderExpand(sublime_plugin.TextCommand):
             words[word].append(reg)
 
             if word not in compiled_regexes:
-                compiled_regexes[word] = re.compile(r"\b" + re.escape(word) + r"\b")
+                compiled_regexes[word] = re.compile(
+                    word_start + re.escape(word) + word_end
+                )
+
             regex = compiled_regexes[word]
 
-            if not word.isalnum() or not regex.search(surroundings):
-                middle.add(word)
-
-        buffer_iter = buffer_slice(v, forward)
-        buffer_iter.send(None)
+            if not regex.search(surroundings):
+                compiled_regexes[word] = re.compile(re.escape(word))
 
         for word, regs in words.items():
             a, b = regs[-1]
             idx = (0, 0) if find_all else (b, a) if (a > b) is forward else (a, b)
-            rgx = re.escape(word) if word in middle else compiled_regexes[word]
             revert = all(reg.a > reg.b for reg in regs) is forward
 
-            while idx := buffer_iter.send((*idx, rgx)):
+            while (idx := b_iter_f.send((idx[1], compiled_regexes[word])))[0]:
                 add_region(vid, *(idx[::-1] if revert else idx), 0.0)
                 if skip:
                     subtract_region(vid, a, b)
@@ -220,7 +199,7 @@ class SmarterFindUnderExpand(sublime_plugin.TextCommand):
         show_point(vid, s[-1 if forward else 0].b, True, False, True)
 
 
-class MultipleCursorsFromSelectionCommand(sublime_plugin.TextCommand):
+class MultipleCursorsFromSelectionCommand(TextCommand):
     def run(self, _, after: bool = False) -> None:
         v = self.view
         vi = v.id()
@@ -239,7 +218,7 @@ class MultipleCursorsFromSelectionCommand(sublime_plugin.TextCommand):
             add_point(vi, pt)
 
 
-class RevertSelectionCommand(sublime_plugin.TextCommand):
+class RevertSelectionCommand(TextCommand):
     def run(self, _) -> None:
         buf = self.view
         sel = buf.sel()
@@ -265,96 +244,63 @@ class RevertSelectionCommand(sublime_plugin.TextCommand):
             buf.show(sel[-1].b, True)
 
 
-class SingleSelectionLastCommand(sublime_plugin.TextCommand):
-    def run(self, _) -> None:
+class SingleSelectionCommand(TextCommand):
+    def run(self, _, index: int = 0) -> None:
         buf = self.view
-        reg = buf.sel()[-1]
+        reg = buf.sel()[index]
         buf.sel().clear()
         buf.sel().add(reg)
-        buf.show(reg.b, True)
+        buf.show_at_center(reg.b)
 
 
-class SmarterSearchCommand(sublime_plugin.WindowCommand):
-    """remember to disable auto_find_in_selection"""
-    def run(self, panel: str="find", reverse: bool = False) -> None:
-        w = active_window()
+class SmartFindWordCommand(sublime_plugin.TextCommand):
+    def run(self, _) -> None:
+        v = self.view
+        vid = v.view_id
+        s = selections(vid)
+        word_separators = re.escape(v.settings().get("word_separators"))
+        word = re.compile(f"[^{word_separators}\\s]+")
 
-        if (view := w.active_view()) is None:
-            return
+        b_iter = buffer_slice(v, True)
+        b_iter.send(None)
 
-        vi = view.id()
-        sel = view.sel()
-        toggle = any(" " in substr(vi, r.a, r.b) for r in sel)
+        b_iterb = buffer_slice(v, False)
+        b_iterb.send(None)
+        pts = []
+        for reg in s:
+            caret = reg.b
 
-        key = f"{vi}_cursors"
-        cursors = [(r.a, r.b) for r in sel]
-        w.settings().set(key, cursors)
+            candidatef_priority = 0
+            candidateb_priority = 0
 
-        w.run_command(cmd="show_panel", args={"panel": panel, "reverse": reverse})
-        # w.run_command(cmd="left_delete")
-        if toggle:
-            w.run_command(cmd="toggle_in_selection")
-
-
-class HideSearchInSelectionCommand(sublime_plugin.WindowCommand):
-    def run(self) -> None:
-        w = active_window()
-        if (view := w.active_view()) is None:
-            return
-
-        vi = view.id()
-        w.run_command(cmd="hide_panel", args={"cancel": True})
-
-        vi = view.id()
-        key=f"{vi}_cursors"
-        if not (cursors := w.settings().get(key)):
-            return
-
-        view.sel().clear()
-        for cursor in cursors:
-            add_region(vi, *cursor, 0.0)
-        w.settings().erase(key)
-
-
-class SplitSelectionIntoLinesCommand(sublime_plugin.TextCommand):
-    newline = r"\r?\n+"
-    whitespace = r"\s+"
-    word_n_punctuation = r"[^-\._\w]+"
-    word_n_punctuation_ext = r"[^-_\w]+"
-
-    regex_order = [
-        newline,
-        whitespace,
-        word_n_punctuation_ext,
-    ]
-
-    def bounds(self, regex: str):
-        buf: View = self.view
-        selections = buf.sel()
-        word_boundaries = []
-        for region in selections:
-            if region.empty():
+            b_end, b_start = b_iterb.send((caret, word))
+            f_start, f_end = b_iter.send((caret, word))
+            if f_start is None and b_end is None:
                 continue
-            contents = buf.substr(region)
-            begin = region.begin()
-            local_bounds = [
-                (m.start() + begin, m.end() + begin)
-                for m in re.finditer(regex, contents)
-            ]
-            word_boundaries.extend(local_bounds)
-        return word_boundaries
 
-    def run(self, edit: Edit) -> None:
-        view = self.view
-        vid = view.id()
-        sels = self.view.sel()
-        for regex in self.regex_order:
-            if word_boundaries := self.bounds(regex):
-                if len(sels) == len(word_boundaries) and all(
-                    w[0] == r.begin() and w[1] == r.end()
-                    for w, r in zip(word_boundaries, sels)
-                ):
-                    return
-                for r in word_boundaries:
-                    subtract_region(vid, *r)
-                return
+            current_line_end = v.full_line(caret).b
+
+            if f_start is not None and current_line_end == v.full_line(f_start).b:
+                candidatef_priority += 1
+
+            if b_end is not None and current_line_end == v.full_line(b_end).b:
+                candidateb_priority += 1
+
+            if candidateb_priority > candidatef_priority:
+                candidate = (b_start, b_end)
+            elif candidateb_priority < candidatef_priority:
+                candidate = (f_start, f_end)
+            elif b_end == f_start:
+                candidate = (b_start, f_end)
+            elif (caret - b_end) < (f_start - caret):
+                candidate = (b_start, b_end)
+            else:
+                candidate = (f_start, f_end)
+            pts.append(candidate)
+
+        if not pts:
+            return
+
+        self.view.sel().clear()
+        for a, b in pts:
+            add_region(vid, a, b, -1)

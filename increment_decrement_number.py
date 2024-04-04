@@ -36,6 +36,7 @@ class NumberCommand(sublime_plugin.TextCommand):
                     continue
 
             if not (line := buf.substr(buf.full_line(region.b))):
+
                 continue
 
             line_no, column = buf.rowcol(region.b)

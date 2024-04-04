@@ -1,246 +1,252 @@
+import enum
 import re
-from re import IGNORECASE
-from typing import List, Optional
+from typing import Callable, Optional, Tuple
 
 import sublime_plugin
-from sublime import DRAW_NO_OUTLINE, Edit, PopupFlags, Region, Selection, View
-from sublime_api import view_add_phantom, view_add_regions  # pyright: ignore
+from sublime import NO_UNDO, Edit, PhantomLayout, PopupFlags, Region, Selection
+from sublime_api import view_selection_add_point as add_point  # pyright: ignore
 from sublime_api import view_selection_add_region as add_region  # pyright: ignore
-from sublime_plugin import TextCommand
 
-from .base import buffer_slice
+from .base import NUMBERS, buffer_slice, cursor_animate
 
-charlist = "1234567890"
-only_single_chars = charlist + "_\\./()\"'-:,;<>~!@#$%^&*|+=[]{}`~?/"
-
-_search_string = ""
-_forward = True
-_extend = False
-matches = []
+error = "region.redish"
+success = "region.bluish"
+NOFLAG = 0
 
 
-def set_chars(
-    search_string: Optional[str] = None,
-    forward: Optional[bool] = None,
-    extend: Optional[bool] = None,
-) -> None:
-    global _search_string
-    global _forward
-    global _extend
-    if search_string is not None:
-        _search_string = search_string
-    if forward is not None:
-        _forward = forward
-    if extend is not None:
-        _extend = extend
+class SneakStatus(enum.IntFlag):
+    NONE = 0
+    REPEAT = 1
+    HAS_MATCH = 2
+    NEW_SEARCH = 4
+    WAITING = 8
+    END_OF_BUFFER = 16
 
 
-class NextCharacterBaseCommand(sublime_plugin.TextCommand):
-    def add_hl(self, color: str, regions, name: str) -> None:
-        vid = self.view.id()
-        view_add_regions(
-            vid, name, regions, color, "", DRAW_NO_OUTLINE, [], "", None, None
-        )
+def get_html(color: str, size: str = "1rem", bold: bool = False) -> str:
+    return f"""<body
+        style="
+            font-size: {size};
+            {"font-weight: bold;" if bold else ""}
+            padding: 0;
+            margin: 0;
+            border-width: 0;
+            color:{color};
+        ">
+        {{char}}</body>"""
 
+
+class SneakCommand(sublime_plugin.TextCommand):
     def execute(
-        self, search_string: str, forward: bool, extend: bool, special: bool
-    ) -> bool:
+        self,
+        search_string: str,
+        forward: bool,
+        extend: bool,
+        offset: int,
+        escape_regex: bool,
+    ) -> Tuple[bool, Callable]:
         v = self.view
-        global matches
-        matches = []
+        vid = v.view_id
 
         s = v.sel()
-        if forward:
-            offset = -1 if special else 0
-        else:
+        if not forward:
             search_string = search_string[::-1]
-            offset = 2 if special else 0
 
-        flags = 0
+        flags = NOFLAG
         if search_string.islower():  # smartcase
-            flags += IGNORECASE
-        rgx = re.compile(re.escape(search_string), flags)
+            flags |= re.IGNORECASE
+        if escape_regex:
+            search_string = re.escape(search_string)
+        rgx = re.compile(search_string, flags)
 
         vid = v.id()
-        bufind = buffer_slice(v, forward)
-        bufind.send(None)
+        b_iter = buffer_slice(v, forward)
+        b_iter.send(None)
+
         cursors = []
         seen = set()
         for _, end in s if forward else reversed(s):
-            while m := bufind.send((end + offset, rgx)):
-                _, end = m
-                if end not in seen:
-                    seen.add(end)
+            end += offset
+            while (m := b_iter.send((end, rgx)))[0] is not None:
+                start, end = m
+                if start not in seen:
+                    seen.add(start)
                     cursors.append(m)
                     break
 
         if not cursors:
-            return False
+            return False, lambda: None
 
         if forward and extend:
-            cursors = [(r.begin(), b) for r, (_, b) in zip(s, cursors)]
+            cursors = [(r.begin(), a) for r, (a, _) in zip(s, cursors)]
         elif not forward and extend:
-            cursors = [(r.end(), b) for r, (_, b) in zip(s, cursors)]
+            cursors = [(r.end(), b) for r, (_, b) in zip(reversed(s), cursors)]
+        elif forward and not extend:
+            cursors = [(a, a) for (a, _) in cursors]
+        elif not forward and not extend:
+            cursors = [(b, b) for (_, b) in cursors]
 
         s.clear()
         for cursor in cursors:
-            add_region(vid, *cursor, 0.0)
-        v.show(s[-1].b, True)
+            add_region(vid, *cursor, -1)
 
-        hls = []
-        iterations = len(charlist) if len(s) == 1 else 1
-        for reg in s if forward else reversed(s):
-            while (reg := bufind.send((*reg, rgx))) and len(hls) < iterations:
-                hls.append(reg)
+        highlights = []
+        num_highlights = len(NUMBERS) if len(s) == 1 else 1
+        for _, end in s:
+            for _ in range(num_highlights):
+                end += 1 if forward else -1
+                m = b_iter.send((end, rgx))
+                if m[0] is None:
+                    break
+                highlights.append(m)
+                end = max(*m) if forward else min(*m)
 
-        if len(s) == 1:
-            matches = [Region(*reg) for reg in hls]
-            for m, c in zip(matches, charlist):
-                view_add_phantom(vid, "Sneak", m, get_html(v).format(char=c), 0, None)
-        else:
-            light_hl: List[Region] = []
-            regular_hl: List[Region] = []
-            cursors = {b for _, b in cursors}
-            for res_a, res_b in hls:
-                reg = Region(res_a, res_b)
-                (light_hl if res_b in cursors else regular_hl).append(reg)
+        color: str = v.style_for_scope(success)["foreground"]
+        regs = [Region(*h) for h in highlights]
 
-            if light_hl:
-                self.add_hl("light", light_hl, "Sneaks")
-            if regular_hl:
-                self.add_hl("accent", regular_hl, "Sneak")
+        def highlight_func():
+            if len(s) == 1:
+                base_html = get_html(color, "1.2rem", bold=True)
+                for reg, number in zip(regs, NUMBERS):
+                    content = base_html.format(char=number)
+                    v.add_phantom("sneak.phantoms", reg, content, PhantomLayout.INLINE)
 
-        return True
+                v.settings().set("sneak.matches", highlights)
 
+            v.add_regions("sneak.regions", regs, success, "", NO_UNDO)
 
-class GoToNthMatchCommand(TextCommand):
-    def run(self, _, number: int) -> None:
+        return True, highlight_func
+
+    def reset_all(self):
         v = self.view
-        v.settings().set(key="has_stored_search", value=False)
-        v.settings().set(key="needs_char", value=False)
+        s = v.settings()
+        s.erase("sneak.waiting")
+        s.erase("sneak.match")
+
+        s.erase("sneak.matches")
+
+        v.erase_phantoms("sneak.phantoms")
+        v.erase_regions("sneak.regions")
+
+    def run(
+        self,
+        _: Edit,
+        forward: Optional[bool] = None,
+        extend: Optional[bool] = None,
+        character: str = "",
+        keep: int = 0,
+        animate_cursor: bool = True,
+        escape_regex: bool = True,
+    ) -> None:
+        status: SneakStatus = SneakStatus.NONE
+
+        v = self.view
+        sels: Selection = v.sel()
+        s = v.settings()
+
+        if len(sels) < 1:
+            add_point(v.view_id, 1)
+
+        last_search: str = s.get("sneak.search", "")  # pyright: ignore
+        search_string = last_search[:keep]
+        search_string += character
+
+        if last_search == search_string:
+            status |= SneakStatus.REPEAT
+
+        if len(search_string) < keep:
+            status |= SneakStatus.WAITING
+
+        if len(search_string) == 0:
+            status |= SneakStatus.NEW_SEARCH | SneakStatus.WAITING
+
+        if forward is None:
+            forward: bool = s.get("sneak.forward", True)  # pyright: ignore
+        if extend is None:
+            extend: bool = s.get("sneak.extend", True)  # pyright: ignore
+
+        highlight_func = lambda: None
+        if not status & SneakStatus.NEW_SEARCH:
+            # offset ensures we start looking at the correct place
+            # we force move the cursor if repeating, otherwise stay
+            if forward:
+                offset = 1 if status & SneakStatus.REPEAT else 0
+            else:
+                # when moving backwards through the buffer, we need a special offset
+                offset = -1 if status & SneakStatus.REPEAT else len(search_string)
+
+            found_match, highlight_func = self.execute(
+                search_string, forward, extend, offset, escape_regex
+            )
+
+            if found_match:
+                status |= SneakStatus.HAS_MATCH
+            else:
+                status |= SneakStatus.END_OF_BUFFER
+
+            if animate_cursor:
+                cursor_animate(v, duration=0.2)
+
+        if status & SneakStatus.WAITING:
+            arrow: str = f"{search_string}_❯" if forward else f"❮{search_string}_"
+        else:
+            arrow: str = f"{search_string}❯" if forward else f"❮{search_string}"
+
+        style = error if status & SneakStatus.END_OF_BUFFER else success
+        color: str = v.style_for_scope(style)["foreground"]  # pyright: ignore
+
+        # check if we have cursors in view
+        for __, b in v.sel():
+            if v.text_to_window(b)[0]:
+                break
+
+        # ensures the popup is shown in the right place
+        # due to the reset function
+        v.erase_phantoms("sneak.phantoms")
+        highlight_func()
+
+        v.show_at_center(b, False)
+
+        v.show_popup(
+            get_html(color, bold=extend).format(char=arrow),
+            flags=PopupFlags.HIDE_ON_CHARACTER_EVENT,
+            location=b,
+            on_hide=self.reset_all,
+        )
+        # popup hides the previous popup, i.e. running cancel functions.
+
+        v.erase_phantoms("sneak.phantoms")
+        highlight_func()
+
+        s.set("sneak.search", search_string)
+        s.set("sneak.forward", forward)
+        s.set("sneak.extend", extend)
+
+        s.set("sneak.match", bool(status & SneakStatus.HAS_MATCH))
+        s.set("sneak.waiting", bool(status & SneakStatus.WAITING))
+
+
+class SneakNthMatchCommand(sublime_plugin.TextCommand):
+    def run(self, _, match: int) -> None:
+        v = self.view
+        vid = v.view_id
         sels: Selection = v.sel()
 
-        if len(sels) != 1:
-            return
-
-        if len(matches) < number:
+        matches = self.view.settings().get("sneak.matches") or []
+        if len(matches) <= match:
+            cursor_animate(v, duration=0.2)
+            v.hide_popup()  # remove highlights
             return
 
         region = sels[0]
-        num: Region = matches[number - 1]
-        if _extend:
-            pt = num.b
-            start = region.a
-            sels.clear()
-            sels.add(Region(start, pt))
-        else:
-            sels.clear()
-            sels.add(Region(num.a, num.b))
-        v.show(sels[0].b, True)
+        num: Tuple[int, int] = matches[match]
+        pt = min(num)
 
+        start = region.a if v.settings().get("sneak.extend") else pt
 
-class SneakListenCommand(TextCommand):
-    def run(self, _, forward: bool, extend: bool = False) -> None:
-        """
-        Sets the buffer ready for search
-        """
-        set_chars("", forward, extend)
-        arrow: str = "_❯" if forward else " ❮_"
-        self.view.settings().set(key="needs_char", value=True)
-        format_search_arrow(arrow, self.view)
+        sels.clear()
+        add_region(vid, start, pt, -1)
 
-
-def format_search_arrow(arrow, view: View, blue: bool = True) -> None:
-    view.show_popup(
-        get_html(view, blue=blue).format(char=arrow),
-        flags=PopupFlags.HIDE_ON_CHARACTER_EVENT,
-        location=view.sel()[-1].b,
-    )
-
-
-def get_html(view: View, blue=True) -> str:
-    if blue:
-        bg_color = view.style()["accent"]
-    else:
-        bg_color = view.style()["redish"]
-    fg_color = view.style()["background"]
-    return """<body
-        style="
-            padding: 0 2px 0 1px;
-            margin: 0;
-            border-radius:2px;
-            background-color:{background};
-            color:{color};
-        ">
-        <div>{{char}}</div>
-    </body>""".format(
-        background=bg_color, color=fg_color
-    )
-
-
-class SneakCommand(NextCharacterBaseCommand):
-    def run(self, edit: Edit, character: str) -> None:
-        global matches
-        search_string = _search_string + character
-        v = self.view
-        sels: Selection = v.sel()
-
-        if len(sels) < 1:
-            return
-
-        if (
-            len(search_string) == 2
-            and matches
-            and (idx := charlist.find(character)) != -1
-        ):
-            v.settings().set(key="has_stored_search", value=False)
-            v.settings().set(key="needs_char", value=False)
-            region = sels[0]
-            num: Region = matches[idx]
-            if _extend:
-                pt = num.b
-                start = region.a
-                sels.clear()
-                sels.add(Region(start, pt))
-            else:
-                sels.clear()
-                sels.add(Region(num.a, num.b))
-            v.show(sels[0].b, True)
-            return
-
-        set_chars(search_string)
-
-        val = self.execute(
-            search_string=search_string,
-            forward=_forward,
-            extend=_extend,
-            special=len(search_string) == 2,
-        )
-
-        self.view.settings().set(key="has_stored_search", value=val)
-
-        if len(search_string) == 2 or character in only_single_chars or not val:
-            self.view.settings().set(key="needs_char", value=False)
-            arrow = f"{search_string}❯" if _forward else f"❮{search_string}"
-        else:
-            arrow = f"{search_string}_❯" if _forward else f"❮{search_string}_"
-
-        format_search_arrow(arrow, self.view, val)
-
-
-class SneakRepeatCommand(NextCharacterBaseCommand):
-    def run(self, _, forward: bool) -> None:
-        if not _search_string:
-            return
-
-        val = self.execute(
-            _search_string, forward=forward, extend=_extend, special=False
-        )
-        self.view.settings().set(key="has_stored_search", value=val)
-
-        if len(_search_string) == 2 or _search_string in only_single_chars:
-            arrow = f"{_search_string}❯" if forward else f"❮{_search_string}"
-        else:
-            arrow = f"{_search_string}_❯" if forward else f"❮{_search_string}_"
-
-        format_search_arrow(arrow, self.view, val)
+        if not v.text_to_window(num[1])[0]:
+            v.show_at_center(num[1], False)
+        cursor_animate(v, duration=0.2)
